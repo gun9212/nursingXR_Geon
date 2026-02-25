@@ -21,8 +21,8 @@ import logging
 import sys
 from pathlib import Path
 
-from discover import discover
-from step1_nid_crawler import CrawlPipeline
+from step1_discovery import discover
+from step2_crawler_parser import CrawlPipeline
 
 # ============================================================================
 # 로깅 설정
@@ -74,7 +74,7 @@ def run_pipeline(keyword: str, max_sources: int = 5):
 
             # LLM Filtering
             logger.info("  [Filter] LLM 적합성 필터링 평가 중...")
-            from llm_filter import check_relevance
+            from step3_llm_filter import check_relevance
             eval_result = check_relevance(pipeline.raw_text)
             
             if not eval_result.get("is_relevant", True):

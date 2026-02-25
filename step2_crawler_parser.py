@@ -36,7 +36,7 @@ except ImportError:
     raise
 
 from jsonschema import validate, ValidationError
-from discover import DiscoveredSource
+from step1_discovery import DiscoveredSource
 
 # ============================================================================
 # 로깅

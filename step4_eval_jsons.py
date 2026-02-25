@@ -2,7 +2,7 @@ import os
 import json
 import logging
 from pathlib import Path
-from llm_filter import check_relevance
+from step3_llm_filter import check_relevance
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("Eval")
