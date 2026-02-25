@@ -1,0 +1,203 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "NursingCare_CrawledData",
+    "type": "object",
+    "required": [
+        "topic",
+        "keyword",
+        "sections",
+        "source_metadata"
+    ],
+    "properties": {
+        "topic": {
+            "type": "string",
+            "description": "대주제 (예: 치매 요양보호 기술)"
+        },
+        "keyword": {
+            "type": "string",
+            "description": "타겟 키워드 분류"
+        },
+        "sections": {
+            "type": "array",
+            "minItems": 0,
+            "items": {
+                "type": "object",
+                "required": [
+                    "section_title",
+                    "section_number",
+                    "chapters"
+                ],
+                "properties": {
+                    "section_title": {
+                        "type": "string",
+                        "description": "절 제목 (예: 1절 치매 대상자와 가족)"
+                    },
+                    "section_number": {
+                        "type": "integer",
+                        "minimum": 0
+                    },
+                    "chapters": {
+                        "type": "array",
+                        "minItems": 0,
+                        "items": {
+                            "type": "object",
+                            "required": [
+                                "chapter_title",
+                                "chapter_number",
+                                "items"
+                            ],
+                            "properties": {
+                                "chapter_title": {
+                                    "type": "string",
+                                    "description": "장 제목 (예: 1. 치매가족이 느끼는 부담의 종류)"
+                                },
+                                "chapter_number": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                },
+                                "items": {
+                                    "type": "array",
+                                    "minItems": 0,
+                                    "items": {
+                                        "type": "object",
+                                        "required": [
+                                            "item_title",
+                                            "description"
+                                        ],
+                                        "properties": {
+                                            "item_title": {
+                                                "type": "string",
+                                                "description": "항목 제목 (예: 1) 경제적 부담)"
+                                            },
+                                            "description": {
+                                                "type": "string",
+                                                "description": "상세 설명 본문 (최소 10자 이상)"
+                                            },
+                                            "tags": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "string",
+                                                    "enum": [
+                                                        "정의",
+                                                        "절차",
+                                                        "주의사항",
+                                                        "팁",
+                                                        "DISEASE",
+                                                        "SYMPTOM",
+                                                        "NURSING_ACTION",
+                                                        "MEDICATION"
+                                                    ]
+                                                },
+                                                "description": "문장 유형 및 NER 엔티티 태그"
+                                            },
+                                            "table_data": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "additionalProperties": {
+                                                        "type": "string"
+                                                    }
+                                                },
+                                                "description": "본문 내 표 데이터 (선택)"
+                                            },
+                                            "sub_items": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "required": [
+                                                        "sub_title",
+                                                        "sub_description"
+                                                    ],
+                                                    "properties": {
+                                                        "sub_title": {
+                                                            "type": "string",
+                                                            "description": "하위 항목 제목 (예: 분노, 우울, 피로 등)"
+                                                        },
+                                                        "sub_description": {
+                                                            "type": "string",
+                                                            "description": "하위 항목 상세 설명 (원문 100% Verbatim 보존)"
+                                                        }
+                                                    }
+                                                },
+                                                "description": "깊은 불릿 포인트 하위 항목 (선택)"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "source_metadata": {
+            "type": "object",
+            "required": [
+                "source_name",
+                "source_url",
+                "crawled_at"
+            ],
+            "properties": {
+                "source_name": {
+                    "type": "string"
+                },
+                "source_url": {
+                    "type": "string"
+                },
+                "original_language": {
+                    "type": "string",
+                    "enum": [
+                        "ko",
+                        "en"
+                    ]
+                },
+                "doi": {
+                    "type": "string"
+                },
+                "crawled_at": {
+                    "type": "string",
+                    "format": "date-time"
+                },
+                "translation_engine": {
+                    "type": [
+                        "string",
+                        "null"
+                    ],
+                    "description": "사용된 번역 엔진 (한국어 원본의 경우 null)"
+                },
+                "extra": {
+                    "type": "object",
+                    "description": "부가 메타데이터 (DOI, PMCID, 저자 등)"
+                }
+            }
+        },
+        "learning_objectives": {
+            "type": "array",
+            "items": {
+                "type": "string"
+            },
+            "description": "학습목표 목록 (선택)"
+        },
+        "extracted_korean_guidelines": {
+            "type": "array",
+            "description": "실무 가이드라인을 번역/추출한 한국어 핵심 데이터 (환각 방제를 위해 영어 원문과 1:1 매핑)",
+            "items": {
+                "type": "object",
+                "required": [
+                    "original_english_text",
+                    "translated_korean_guideline"
+                ],
+                "properties": {
+                    "original_english_text": {
+                        "type": "string",
+                        "description": "LLM이 본문에서 발췌한 영어 원문 텍스트"
+                    },
+                    "translated_korean_guideline": {
+                        "type": "string",
+                        "description": "해당 원문을 한국어로 충실하게 번역/요약한 실무 가이드라인 텍스트"
+                    }
+                }
+            }
+        }
+    }
+}
