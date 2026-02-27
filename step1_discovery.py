@@ -8,7 +8,9 @@ Source Discovery Module — 키워드 기반 자동 소스 탐색 엔진
 
 탐색 소스:
     1. Europe PMC REST API — Open Access 논문 PDF
-    2. 중앙치매센터(NID) 자료실 — 국내 가이드북 PDF
+    2. PubMed E-utilities API — 의학 문헌 검색 (PDF/HTML)
+    3. Wikipedia 검색 — 관련 한글 위키피디아 항목 (HTML)
+    4. 중앙치매센터(NID) 자료실 — 국내 가이드북 PDF
 
 필수 패키지:
     pip install requests beautifulsoup4 lxml
@@ -25,9 +27,21 @@ import re
 import logging
 from dataclasses import dataclass
 from typing import List, Optional
+from pathlib import Path
+# from playwright.sync_api import sync_playwright
 
 import requests
 from bs4 import BeautifulSoup
+
+try:
+    from openai import OpenAI
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+except ImportError:
+    client = None
 
 logger = logging.getLogger("Discovery")
 
@@ -118,13 +132,13 @@ def discover_europepmc(keyword_en: str, max_results: int = 5) -> List[Discovered
         if not pmcid:
             continue
 
-        # PMC PDF URL 생성
-        pdf_url = f"https://europepmc.org/backend/ptpmcrender.fcgi?accid={pmcid}&blobtype=pdf"
+        # PMC XML API 엔드포인트 생성
+        xml_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
 
         source = DiscoveredSource(
             title=item.get("title", "Untitled"),
-            url=pdf_url,
-            format="pdf",
+            url=xml_url,
+            format="xml",
             source_name="Europe PMC",
             language="en",
             license_type="Open Access",
@@ -259,83 +273,288 @@ NID_RESOURCE_URLS = [
     "https://www.nid.or.kr/info/dataroom_list.aspx",
 ]
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+PDF_DIR = PROJECT_ROOT / "pdf"
+PDF_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def discover_nid(keyword_ko: str, max_results: int = 5) -> List[DiscoveredSource]:
     """
-    중앙치매센터 자료실에서 키워드 관련 PDF를 탐색.
-
-    전략:
-        - 자료실 목록 페이지를 HTML 크롤링
-        - 제목에 키워드가 포함된 항목의 다운로드 링크 추출
-        - .pdf, .hwp 확장자 링크 수집
+    [Skip]: Playwright is currently disabled to speed up the environment setup.
     """
-    logger.info(f"  [NID] 자료실 탐색: '{keyword_ko}'")
+    logger.info(f"  [NID] Playwright is disabled. Skipping NID scraping for '{keyword_ko}'...")
+    return []
+
+    # Original code commented out to avoid playwright execution
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(accept_downloads=True)
+            page = context.new_page()
+
+            search_url = f"https://www.nid.or.kr/info/dataroom_list.aspx?sword={keyword_ko}"
+            page.goto(search_url, timeout=30000)
+            
+            # 목록 테이블 기다리기
+            try:
+                page.wait_for_selector(".body_table th.th_title a", timeout=10000)
+            except Exception:
+                logger.info("  [NID] 검색 결과가 없습니다.")
+                browser.close()
+                return []
+
+            rows = page.locator(".body_table th.th_title a")
+            count = rows.count()
+            
+            article_links = []
+            for i in range(count):
+                if len(article_links) >= max_results:
+                    break
+                link = rows.nth(i)
+                title = link.inner_text().strip()
+                href = link.get_attribute("href")
+                
+                # 제목에 키워드가 있는지 확인
+                if keyword_ko in title and href:
+                    article_links.append((title, href))
+
+            for title, href in article_links:
+                if len(sources) >= max_results:
+                    break
+                    
+                article_url = f"https://www.nid.or.kr/info/{href}"
+                article_page = context.new_page()
+                try:
+                    article_page.goto(article_url, timeout=30000)
+                    # 다운로드 버튼(fn_download 포함) 찾기
+                    pdf_links = article_page.locator("a[onclick*='/download/download.aspx']")
+                    pdf_count = pdf_links.count()
+                    
+                    for j in range(pdf_count):
+                        pdf_link = pdf_links.nth(j)
+                        pdf_text = pdf_link.inner_text().lower()
+                        
+                        if ".pdf" in pdf_text or "download" in pdf_text:
+                            logger.info(f"  [NID] 다운로드 트리거 발견: {pdf_text}")
+                            with article_page.expect_download(timeout=60000) as download_info:
+                                pdf_link.click()
+                                
+                            download = download_info.value
+                            import re
+                            safe_name = re.sub(r'[^\w\-.]', '_', title[:40]) + ".pdf"
+                            download_path = PDF_DIR / safe_name
+                            download.save_as(download_path)
+                            
+                            logger.info(f"  [NID] 로컬 PDF 저장 완료: {download_path.name}")
+                            
+                            source = DiscoveredSource(
+                                title=title,
+                                url=str(download_path.absolute()),
+                                format="local_pdf", # 다운로드 불필요
+                                source_name="중앙치매센터",
+                                language="ko",
+                                license_type="공공저작물 자유이용"
+                            )
+                            sources.append(source)
+                            break # 게시글당 PDF 하나만
+                            
+                except Exception as e:
+                    logger.warning(f"  [NID] 개별 게시글 크롤링 실패 ({article_url}): {e}")
+                finally:
+                    article_page.close()
+                    
+            browser.close()
+            
+    except Exception as e:
+        logger.warning(f"  [NID] Playwright 동적 크롤링 전체 실패: {e}")
+
+    logger.info(f"  [NID] PDF 소스 {len(sources)}개 획득")
+    return sources
+
+
+# ============================================================================
+# 4. PubMed API 탐색
+# ============================================================================
+def discover_pubmed(keyword_en: str, max_results: int = 5) -> List[DiscoveredSource]:
+    """
+    NCBI E-utilities API를 사용하여 PubMed 논문 검색.
+    Free Full Text 필터를 적용하며, 가급적 PMC 연동 링크(pdf) 또는 PubMed 링크(html)를 반환.
+    """
+    logger.info(f"  [PubMed] E-utilities 탐색: '{keyword_en}'")
     sources = []
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                      "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "ko-KR,ko;q=0.9",
+    
+    search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    query = f'"{keyword_en}" AND ({NURSING_TERMS}) AND free full text[sb]'
+    params = {
+        "db": "pubmed",
+        "term": query,
+        "retmode": "json",
+        "retmax": max_results
     }
+    try:
+        resp = requests.get(search_url, params=params, timeout=15)
+        resp.raise_for_status()
+        pmids = resp.json().get("esearchresult", {}).get("idlist", [])
+    except Exception as e:
+        logger.warning(f"  [PubMed] ESearch 실패: {e}")
+        return []
+        
+    if not pmids:
+        logger.info("  [PubMed] 검색 결과가 없습니다.")
+        return []
+        
+    summary_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+    summary_params = {
+        "db": "pubmed",
+        "id": ",".join(pmids),
+        "retmode": "json"
+    }
+    try:
+        resp = requests.get(summary_url, params=summary_params, timeout=15)
+        resp.raise_for_status()
+        summary_data = resp.json().get("result", {})
+    except Exception as e:
+        logger.warning(f"  [PubMed] ESummary 실패: {e}")
+        return []
 
-    for base_url in NID_RESOURCE_URLS:
-        try:
-            resp = requests.get(base_url, headers=headers, timeout=15)
-            resp.raise_for_status()
-            resp.encoding = "utf-8"
-            soup = BeautifulSoup(resp.text, "lxml")
-        except requests.RequestException as e:
-            logger.warning(f"  [NID] 페이지 접근 실패: {base_url} ({e})")
+    for pmid in pmids:
+        item = summary_data.get(pmid, {})
+        if not item:
             continue
-
-        # 모든 링크에서 PDF/HWP 다운로드 URL 추출
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag["href"]
-            title = a_tag.get_text(strip=True)
-
-            # PDF 링크 필터
-            is_pdf = (
-                href.lower().endswith(".pdf")
-                or "download" in href.lower()
-                or "file" in href.lower()
-            )
-            if not is_pdf:
-                continue
-
-            # 키워드 매칭 (제목 또는 주변 텍스트에 키워드 포함)
-            context = title
-            parent = a_tag.find_parent("tr") or a_tag.find_parent("li")
-            if parent:
-                context = parent.get_text(strip=True)
-
-            if keyword_ko not in context:
-                continue
-
-            # 상대 URL → 절대 URL 변환
-            if href.startswith("/"):
-                href = f"https://www.nid.or.kr{href}"
-            elif not href.startswith("http"):
-                href = f"https://www.nid.or.kr/{href}"
-
-            source = DiscoveredSource(
-                title=title or "NID 자료",
-                url=href,
-                format="pdf",
-                source_name="중앙치매센터",
-                language="ko",
-                license_type="공공저작물 자유이용",
-            )
-            sources.append(source)
-            if len(sources) >= max_results:
+            
+        title = item.get("title", "Untitled")
+        
+        pmcid = ""
+        for articleid in item.get("articleids", []):
+            if articleid.get("idtype") == "pmcid":
+                raw_pmcid = articleid.get("value", "")
+                # Ex: "pmc-id: PMC12924979;" -> "PMC12924979"
+                match = re.search(r'(PMC?\d+)', raw_pmcid)
+                if match:
+                    pmcid = match.group(1)
+                else:
+                    pmcid = raw_pmcid.strip()
                 break
+                
+        doi = ""
+        for articleid in item.get("articleids", []):
+            if articleid.get("idtype") == "doi":
+                doi = articleid.get("value")
+                break
+                
+        if pmcid:
+            # PMC에 연동된 문서는 무조건 XML API 사용 (가장 빠르고 안정적)
+            # 주의: PubMed 결과의 pmcid는 "PMC" 접두사가 없을 수도 있으므로 확인
+            if not pmcid.startswith("PMC"):
+                pmcid_str = f"PMC{pmcid}"
+            else:
+                pmcid_str = pmcid
+            url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid_str}/fullTextXML"
+            fmt = "xml"
+            license_type = "Open Access XML"
+        else:
+            url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+            fmt = "html"
+            license_type = "Free Full Text (HTML)"
+            
+        source = DiscoveredSource(
+            title=title,
+            url=url,
+            format=fmt,
+            source_name="PubMed",
+            language="en",
+            license_type=license_type,
+            extra={
+                "pmid": pmid,
+                "pmcid": pmcid,
+                "doi": doi,
+                "journal": item.get("fulljournalname", ""),
+            }
+        )
+        sources.append(source)
+        
+    logger.info(f"  [PubMed] 소스 {len(sources)}개 발견")
+    return sources
 
-    logger.info(f"  [NID] PDF 소스 {len(sources)}개 발견")
+
+# ============================================================================
+# 5. Wikipedia 탐색
+# ============================================================================
+def discover_wikipedia(keyword_ko: str, max_results: int = 5) -> List[DiscoveredSource]:
+    """
+    wikipedia 패키지를 이용하여 한국어 위키피디아 페이지 검색.
+    """
+    logger.info(f"  [Wikipedia] 위키백과 탐색: '{keyword_ko}'")
+    sources = []
+    try:
+        import wikipedia
+    except ImportError:
+        logger.warning("  [Wikipedia] wikipedia 미설치 — pip install wikipedia")
+        return []
+        
+    try:
+        wikipedia.set_lang("ko")
+        # 키워드와 관련된 문서를 검색
+        search_results = wikipedia.search(keyword_ko, results=max_results)
+        
+        for title in search_results:
+            try:
+                page = wikipedia.page(title, auto_suggest=False)
+                source = DiscoveredSource(
+                    title=page.title,
+                    url=page.url,
+                    format="html",
+                    source_name="Wikipedia",
+                    language="ko",
+                    license_type="CC BY-SA",
+                )
+                sources.append(source)
+            except wikipedia.exceptions.DisambiguationError as e:
+                logger.info(f"    - '{title}' 식별 애매함 (Disambiguation) 건너뜀")
+                continue
+            except wikipedia.exceptions.PageError:
+                continue
+            except Exception as e:
+                logger.warning(f"    - '{title}' 페이지 로드 실패: {e}")
+                continue
+                
+    except Exception as e:
+        logger.warning(f"  [Wikipedia] API 호출 실패: {e}")
+        
+    logger.info(f"  [Wikipedia] 소스 {len(sources)}개 발견")
     return sources
 
 
 # ============================================================================
 # 통합 탐색 함수
 # ============================================================================
+def translate_keyword_to_english(keyword: str) -> str:
+    """
+    미정의 한글 키워드가 들어올 경우 LLM을 통해 자동 영문 번역을 수행합니다.
+    """
+    if keyword in KEYWORD_MAP:
+        return KEYWORD_MAP[keyword]
+        
+    if not client:
+        return keyword
+
+    try:
+        logger.info(f"  [AI Translation] '{keyword}'의 영문 매핑이 없어 자동 번역을 시도합니다...")
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a medical & nursing term translator. Translate the given Korean keyword directly into the most appropriate, concise English scientific term. Return ONLY the translated English term, nothing else. For example, if given '당뇨', return 'diabetes'."},
+                {"role": "user", "content": keyword}
+            ],
+            temperature=0.0
+        )
+        translated = response.choices[0].message.content.strip()
+        logger.info(f"  [AI Translation] '{keyword}' -> '{translated}'")
+        return translated
+    except Exception as e:
+        logger.warning(f"  [AI Translation] 번역 실패 ({e}). 원본 키워드를 사용합니다.")
+        return keyword
+
 def discover(keyword: str, max_results: int = 5) -> List[DiscoveredSource]:
     """
     키워드를 입력받아 크롤링 가능한 소스를 자동 탐색.
@@ -354,16 +573,24 @@ def discover(keyword: str, max_results: int = 5) -> List[DiscoveredSource]:
     all_sources: List[DiscoveredSource] = []
 
     # 1. Europe PMC (영문 키워드 변환)
-    keyword_en = KEYWORD_MAP.get(keyword, keyword)
+    keyword_en = translate_keyword_to_english(keyword)
     logger.info(f"  영문 키워드: '{keyword_en}'")
     pmc_sources = discover_europepmc(keyword_en, max_results=max_results)
     all_sources.extend(pmc_sources)
+    
+    # 2. PubMed API (영문 검색)
+    pubmed_sources = discover_pubmed(keyword_en, max_results=max_results)
+    all_sources.extend(pubmed_sources)
 
-    # 2. KCI OAI-PMH (한글 학술논문 — 요양보호 동반 키워드 필터링)
+    # 3. Wikipedia API (한글 검색)
+    wiki_sources = discover_wikipedia(keyword, max_results=max_results)
+    all_sources.extend(wiki_sources)
+
+    # 4. KCI OAI-PMH (한글 학술논문 — 요양보호 동반 키워드 필터링)
     # kci_sources = discover_kci(keyword, max_results=max_results)
     # all_sources.extend(kci_sources)
 
-    # 3. NID 자료실 (한국어 키워드)
+    # 5. NID 자료실 (한국어 키워드)
     nid_sources = discover_nid(keyword, max_results=max_results)
     all_sources.extend(nid_sources)
 

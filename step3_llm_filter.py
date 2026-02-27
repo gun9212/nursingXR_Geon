@@ -1,93 +1,142 @@
+"""
+=============================================================================
+Phase 2: Step 3 - LLM Based Chunking & QA Dataset Generation
+=============================================================================
+목적:
+    output/raw/ 에 저장된 순수 마크다운 원본 텍스트를 읽어들여,
+    GPT-4o (Structured Outputs)를 통해 `schema.json` 기반의 
+    Flat Chunk(의미 단위 문단) 구조 및 가상의 QA 쌍 데이터를 추출한다.
+    결과물은 output/processed/ 에 JSON 파일로 저장한다.
+=============================================================================
+"""
+
 import os
 import json
 import logging
+from pathlib import Path
+from typing import List, Optional
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 try:
     from openai import OpenAI
 except ImportError:
-    OpenAI = None
+    print("[오류] pip install openai pydantic")
+    raise
 
-logger = logging.getLogger("LLMFilter")
+# ============================================================================
+# 로깅 및 경로 설정
+# ============================================================================
+logger = logging.getLogger("Step3_LLM")
+PROJECT_ROOT = Path(__file__).resolve().parent
+PROCESSED_DIR = PROJECT_ROOT / "output" / "processed"
 
-# Load environment variables from .env file
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ============================================================================
+# Pydantic 모델 정의 (schema.json 완벽 매핑용)
+# * OpenAI Structured Outputs 기능은 strict=True 구조를 요구하므로 Pydantic 활용
+# ============================================================================
+# QAPair removed for Phase 5
 
-if OPENAI_API_KEY and OpenAI:
-    client = OpenAI(api_key=OPENAI_API_KEY)
-else:
-    logger.warning("OPENAI_API_KEY is not set or openai is not installed. LLM filtering will be disabled.")
-    client = None
+class Chunk(BaseModel):
+    chunk_id: str = Field(description="이 문서 덩어리의 고유 식별자 ID")
+    search_keywords: List[str] = Field(description="이 문서 블록을 하이브리드 검색으로 찾을 수 있도록 돕는 3~5개의 핵심 질환명 또는 고유 명사 키워드 (예: ['치매', '배회장애', '환경설정'])")
+    raw_text: str = Field(description="잘라진 문서 블록의 파싱된 마크다운 원문 100% (절대 요약하거나 단어를 누락하지 마세요)")
+    selection_reason_ko: str = Field(description="이 문서 블록 안에 요양 돌봄이나 실무 팁이 있다면, 어떤 이유로 이 문서를 선택했는지와 핵심 정보를 한국어로 3줄 요약 (벡터 임베딩용). 팁이 없다면 빈 문자열")
 
-def check_relevance(text: str) -> dict:
-    """
-    Evaluates whether the given text contains practical caregiving guidelines or manuals 
-    using Gemini LLM.
-    """
-    if not client:
-        return {
-            "is_relevant": True, 
-            "reason": "Bypassed: No API key or openai library missing.",
-            "confidence_score": 10
-        }
+class NursingDataModel(BaseModel):
+    document_id: str = Field(description="문서 전체에 부여되는 고유 식별 코드 (예: DOC_001)")
+    document_summary: str = Field(description="이 문서 전체가 다루는 핵심 주제 3줄 요약")
+    chunks: List[Chunk] = Field(description="의미 단위로 쪼개진 Flat Chunk 객체들의 배열")
 
-    prompt = f"""[System]
-당신은 요양 보호 및 간병 실무 데이터를 수집하는 전문 에이전트입니다. 당신의 목표는 입력된 학술 논문이나 문서 내에서 '**가족 간병인 및 요양 보호사에게 실질적으로 도움이 될 만한 돌봄 팁, 대처 방법, 또는 가이드라인이 단 한 문단이라도 포함되어 있는지**' 찾아내는 것입니다.
+# ============================================================================
+# 핵심 처리 함수
+# ============================================================================
+def process_with_llm(raw_md_path: str, source_metadata: dict) -> Optional[Path]:
+    load_dotenv()
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        logger.error("  [LLM Error] OPENAI_API_KEY 환경변수가 설정되지 않았습니다.")
+        return None
+        
+    client = OpenAI(api_key=api_key)
+    
+    with open(raw_md_path, "r", encoding="utf-8") as f:
+        content = f.read()
 
-[Evaluation Criteria (평가 기준)]
-주의: 우리가 수집하는 데이터 원본은 대부분 '학술 논문'입니다. 따라서 논문의 전반적인 주제가 통계, 역학 분석, 정책 제안이더라도, 그 본문 혹은 고찰(Discussion) 부분에 간병인을 위한 "실용적인 조언이나 대처법"이 숨어있다면 반드시 유효한 문서(PASS)로 판단해야 합니다. 너무 엄격하게 자르지 말고, 간병인에게 조금이라도 쓸모가 있다면 PASS 시키세요.
+    logger.info(f"  [Step3] GPT-4o Semantic Chunking & QA 추출 시작: {Path(raw_md_path).name}")
 
-✅ [포함 기준 (Inclusion) - 이 중 하나라도 포함 또는 암시되어 있으면 무조건 PASS]
-1. 돌봄 요령 및 팁 (Care Tips): 개인위생(목욕, 식사 등), 이동 보조(낙상 방지), 투약 관리 등 일상적인 간병 과정에서의 실용적인 조언.
-2. 행동 및 심리적 증상(BPSD) 대처법: 환자의 초조함, 공격성, 배회, 수면 장애 등에 대해 보호자가 취할 수 있는 구체적인 행동 방식이나 환경 개선 팁.
-3. 문제 해결을 위한 중재 프로그램: 특정 지원 프로그램이나 교육 과정의 내용이 간략하게라도 소개되어 있어, 타 간병인이 참고할 만한 정보가 있는 경우.
-4. 간병인 부담 완화 및 의사소통 전략: 간병인 자신의 스트레스 관리법, 의료진 또는 가족과의 갈등 해결/의사소통 요령.
+    # ========================================================================
+    # Pre-chunking (사전 분할) : 최대 8000 글자 단위로 물리적 분할
+    # ========================================================================
+    MAX_CHARS_PER_BLOCK = 8000
+    blocks = [content[i:i+MAX_CHARS_PER_BLOCK] for i in range(0, len(content), MAX_CHARS_PER_BLOCK)]
+    logger.info(f"  [Step3] 문서 크기: {len(content)}자. {len(blocks)}개 블록으로 분할(Pre-chunking)하여 LLM 처리")
 
-❌ [제외 기준 (Exclusion) - 아래에 100% 해당하고 실무 팁이 절대 1글자도 없는 경우에만 FAIL]
-1. 100% 순수 통계/역학 연구: "치매 발병률은 N%이다", "간병인의 스트레스 코르티솔 수치가 N 증가했다" 등 숫자 분석에만 그치고, 그래서 간병인이 '어떻게 행동해야 하는지'에 대한 제언이 아예 없는 경우.
-2. 기초 의학 연구: 세포, 유전자 분석, 신약 화합물 구조 분석 등 돌봄 실무와 완전히 무관한 연구.
+    sys_prompt = """You are an elite Nursing & Caregiving Dataset Creator.
+Your job is to read carefully and extract the core value of medical/nursing text while PRESERVING THE RAW TEXT 100%.
 
-[Input Document]
-{text}
-
-[Extraction & Translation Rules (추출 및 번역 규칙)]
-문서가 PASS 판정을 받았다면, 본문에 있는 실무 가이드라인, 대처 방법, 행동 요령을 샅샅이 찾아내어 한국어로 번역해야 합니다.
-1. 오직 [Input Document]에 명시된 내용만 기반으로 작성하십시오. 본인의 의학적 지식을 덧붙이거나 상상해서 지어내지 마십시오 (No Hallucination).
-2. 원문 텍스트(original_english_text)와 번역된 한국어 가이드라인(translated_korean_guideline)을 1:1 쌍으로 매핑하여 반환하십시오.
-3. 문서가 FAIL인 경우 `extracted_korean_guidelines` 필드는 빈 배열 `[]` 로 반환하십시오.
-
-[Output Format]
-반드시 아래의 JSON 형식으로만 응답하십시오. (다른 마크다운이나 부연 설명은 포함하지 마십시오)
-
-{{
-  "is_relevant": true / false,
-  "confidence_score": 1~10 (10이 가장 확실함),
-  "matched_criteria": [포함 기준에 해당하는 키워드 또는 카테고리 배열],
-  "extracted_korean_guidelines": [
-    {{
-      "original_english_text": "LLM이 본문에서 발췌한 영어 원문 텍스트 (예: Caregivers should lock doors at night)",
-      "translated_korean_guideline": "해당 원문을 한국어로 충실하게 번역/요약한 실무 가이드라인 텍스트 (예: 배회를 방지하기 위해 밤에 문을 잠가야 합니다.)"
-    }}
-  ],
-  "reason": "왜 이 문서가 채택(또는 제외)되었는지 평가 기준에 근거하여 1~2문장으로 설명"
-}}
+[STRICT INSTRUCTIONS]
+1. DO NOT summarize or truncate the `raw_text`. You MUST copy the exact original text provided to you into `raw_text`.
+2. Extract 3 to 5 core `search_keywords` (e.g., disease names, symptoms) for accurate keyword search.
+3. Determine if the text has actionable nursing tips. If yes, write a 3-sentence Korean summary explaining why it is useful in `selection_reason_ko`. If it's pure statistics/unrelated, leave `selection_reason_ko` empty.
+4. If the text is very long, break it into smaller semantic `chunks`, doing steps 1-3 for each chunk.
 """
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={ "type": "json_object" },
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1
-        )
-        result = json.loads(response.choices[0].message.content)
-        return result
-    except Exception as e:
-        logger.error(f"LLM filtering failed: {e}")
-        return {
-            "is_relevant": True, 
-            "reason": f"Error during LLM call: {e}",
-            "confidence_score": 0
-        }
+
+    all_chunks_dumped = []
+    doc_summary = "복합 문서 요약"
+    doc_id = ""
+
+    for idx, block_text in enumerate(blocks):
+        try:
+            logger.info(f"    - 블록 {idx+1}/{len(blocks)} LLM 처리 중...")
+            completion = client.beta.chat.completions.parse(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": block_text}
+                ],
+                response_format=NursingDataModel,
+                temperature=0.0
+            )
+            
+            parsed_result = completion.choices[0].message.parsed
+            if parsed_result:
+                if not doc_id: doc_id = parsed_result.document_id
+                if idx == 0: doc_summary = parsed_result.document_summary
+                
+                for chunk in parsed_result.chunks:
+                    # 빈 이유(쓸모없는 데이터)는 제외 (필터링)
+                    if chunk.selection_reason_ko.strip() != "":
+                        all_chunks_dumped.append(chunk.model_dump())
+                        
+        except Exception as e:
+            logger.error(f"    ⚠️ 블록 {idx+1} 처리 실패: {e}. (건너뜀)")
+            continue
+
+    if not all_chunks_dumped:
+        logger.warning(f"  [Step3] ⚠️ 유효한 청크(Actionable Tip)가 없어 JSON을 생성하지 않습니다: {Path(raw_md_path).name}")
+        return None
+
+    # 스키마(schema.json) 포맷에 맞춰 메타데이터 병합
+    final_data = {
+        "document_id": doc_id,
+        "source_metadata": source_metadata,
+        "document_summary": doc_summary,
+        "chunks": all_chunks_dumped
+    }
+    
+    # 저장 전 Processed 폴더 확보
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # 최종 JSON 저장
+    safe_name = Path(raw_md_path).stem + ".json"
+    out_path = PROCESSED_DIR / safe_name
+    
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(final_data, f, ensure_ascii=False, indent=4)
+        
+    logger.info(f"  [Step3] 성공 — QA Chunk JSON 생성 및 병합 완료 : {out_path.name}")
+    return out_path
+
+if __name__ == "__main__":
+    pass

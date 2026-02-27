@@ -1,66 +1,63 @@
-# 🧠 NID Auto Parser Pipeline 
+# 🧠 NID Auto Parser Pipeline (V2: Flat Extract & Expanded Sources)
 
-이 프로젝트는 **키워드 하나로 중앙치매센터 가이드북과 유럽 글로벌 논문(PMC)을 동시에 자동 탐색하여, 인공지능이 간병 꿀팁(실무 행동 지침)만 쪽집게처럼 뽑아 번역해 주는 데이터 파이프라인**입니다.
+이 프로젝트는 **키워드 기반으로 다양한 출처(Europe PMC, PubMed, 위키피디아, 중앙치매센터)의 문헌과 가이드북을 자동 탐색하여, 원문을 완벽히 보존한 채 인공지능이 간병 꿀팁(실무 행동 지침)과 핵심 요약을 발췌해 주는 데이터 파이프라인**입니다. 
+
+V2 업데이트를 통해 기존의 무거운 계층형(Tree) 파싱 구조를 버리고, 벡터 데이터베이스 관리 및 AI 파인튜닝에 적합한 가볍고 명확한 **Flat JSON 구조**로 개편되었습니다.
 
 ---
 
 ## 🏗 아키텍처 및 프로세스 (How it Works)
 
-자동 파이프라인은 아래 **5단계(Phase)**를 순차적으로 거치며 동작합니다.
+자동 파이프라인은 아래 **4단계(Phase)**를 순차적으로 거치며 동작합니다.
 
 ### 1️⃣ Phase 1. Source Discovery (`step1_discovery.py`)
-**"원하는 주제의 논문 PDF 링크를 알아내는 단계"**
+**"원하는 주제의 문서 링크를 알아내는 단계"**
 
-*   **사용 기술 및 API:** `requests` 라이브러리, **Europe PMC REST API** (유럽 펍메드 센트럴), KCI OAI-PMH (국내 논문, 현재 벤치마킹용 휴식 중), **NID (중앙치매센터)** 웹 크롤링.
-*   **작동 방식:**
-    1. 사용자가 CLI에서 `--keyword "치매"`라고 입력합니다.
-    2. 파이썬 사전에 의해 키워드가 영문(`"dementia"`)으로 자동 번역됩니다.
-    3. Europe PMC API에 `query="dementia" AND ("caregiver" OR "nursing" OR "long-term care") AND OPEN_ACCESS:Y` 라는 복합 검색 조건을 날립니다. (순수 의학 생물학 논문을 거르기 위해 간호/돌봄 키워드를 강제 결합합니다.)
-    4. API가 무료로 접근 가능한(Open Access) 논문들의 **직접 다운로드용 PDF URL 리스트**를 반환합니다.
+*   **탐색 소스 (Expanded):**
+    1. **Europe PMC REST API**: 전 세계 Open Access 논문 PDF 수집. `dementia` 등 키워드 및 `caregiver OR nursing` 필터링 적용.
+    2. **PubMed E-utilities API**: NCBI 펍메드에서 추가적인 무료 원문(Free Full Text) 링크 및 PDF 확보.
+    3. **Wikipedia API**: 파이썬 `wikipedia` 패키지를 사용해 한국어 위키백과 직접 검색.
+    4. **NID (중앙치매센터)**: 한국 치매 가이드북 PDF 링크 크롤링.
+*   **작동 방식:** 사용자가 CLI에서 `--keyword "치매"`라고 입력하면, 파트너 소스들을 순회하며 처리 대상인 문서(DiscoveredSource) 리스트를 구축합니다.
 
-### 2️⃣ Phase 2. PDF Fetch & Extract (`step2_crawler_parser.py`)
-**"논문 파일을 PC로 가져와 글씨를 뽑아내는 단계"**
+### 2️⃣ Phase 2. Document Fetch & Minimal Clean (`step2_crawler_parser.py`)
+**"지식을 다운로드하고 원문을 훼손 없이 안전하게 가져오는 단계"**
 
-*   **사용 라이브러리:** `requests` (스트리밍 다운로드), **`PyMuPDF (fitz)`** (가장 빠르고 강력한 PDF 텍스트 추출 엔진).
-*   **작동 방식:**
-    1. 확보한 PDF URL들을 `requests`를 통해 청크(Chunk) 단위로 끊어서 안전하게 다운로드하여 `pdf/` 폴더에 저장합니다.
-    2. `PyMuPDF` 라이브러리가 해당 PDF를 열어 1페이지부터 끝 페이지까지 돌면서 시각적인 레이아웃 이미지는 무시하고 **오직 텍스트문자표(`raw_text`)만 긁어모읍니다.** (이 시점에서는 보통 5만~8만 글자의 거대한 텍스트 덩어리가 됩니다.)
+*   **다운로드/추출 방식:**
+    1. **PDF 논문/가이드북**: LlamaParse를 통해 PDF의 복잡한 레이아웃을 순수 마크다운 텍스트로 고품질 변환합니다.
+    2. **HTML/위키백과**: 위키백과 패키지 및 bs4를 통해 순수 텍스트 본문만 즉시 크롤링합니다.
+*   **노이즈 제거 (원문 100% 보존 위주):** 
+    과거의 공격적인 제거 방식(References 전체 삭제 등) 대신, 원문 분석의 무결성을 지키기 위해 오직 **페이지 번호, 저작권 문구, 머리말/꼬리말 워터마크** 등 명백한 노이즈만 최소한으로 제거합니다.
+*   **백업:** 다운로드한 텍스트는 보존을 위해 `output/` 디렉토리에 `.txt` 또는 `.html` 로 원본이 백업됩니다.
 
-### 3️⃣ Phase 3. Noise Removal & Parsing (`step2_crawler_parser.py`)
-**"쓸데없는 쓰레기 데이터를 버리고 챕터별로 예쁘게 조립하는 단계"**
+### 3️⃣ Phase 3. LLM Relevance & Tip Extraction (`step3_llm_filter.py`)
+**"본문을 읽고, 유효한 문서를 걸러낸 뒤 실용적인 팁만 뽑아내는 단계"**
 
-*   **사용 기술:** `re` (Python 정규표현식 엔진), `dataclasses` (객체 지향 데이터 구조화).
-*   **작동 방식:**
-    1. **노이즈 컷(Noise Cut):** 거대한 텍스트를 위에서부터 한 줄씩 읽으면서, 정규식을 사용해 페이지 번호("- 1 -"), PDF 헤더 텍스트, 저작권 기호(ⓒ), "[그림 1]" 같은 표 캡션 등 쓸데없는 문자열을 진공청소기처럼 빨아들여 삭제합니다.
-    2. **References(참고문헌) 조기 종료:** (✨핵심 최적화 로직) 논문을 밑으로 계속 읽어 내려가다가 정규식이 **"10. References"** 또는 **"Bibliography"**라는 제목을 발견하는 순간! **파싱을 강제로 즉시 종료시킵니다.** 논문 뒤에 있는 2~3만 글자 분량의 쓸데없는 참고문헌 리스트를 아예 날려버려서 용량과 API 비용을 획기적으로 아낍니다.
-    3. **트리 조립(Tree Structuring):** 살아남은 "순수 본문"을 다시 읽으며 "1. 서론", "2.1 방법론" 같은 헤딩(Heading) 정규식 패턴을 찾아내어, `섹션 -> 챕터 -> 아이템` 이라는 3단계 계층형 트리(JSON 뼈대) 구조로 차곡차곡 조립합니다.
+*   **사용 API:** **OpenAI API (`gpt-4o-mini` 모델)** + JSON Mode
+*   **작동 방식:** 추출된 원문 테스트 전체(`full_text`)를 프롬프트와 함께 전달하여 다음 업무를 수행합니다.
+    1. **적격성 평가 (is_relevant):** 기초 수치 통계나 역학 연구가 아닌, "실제로 간병 가족이나 보호자가 따라 할 수 있는 구체적 행동 팁이 있는가?"를 검증하여 PASS/FAIL을 결정합니다.
+    2. **핵심 요약 (document_summary):** 문서가 무슨 내용을 다루는지 한국어로 2~3줄 요약합니다.
+    3. **행동 지침 발췌 (extracted_tips):** 본문 내에서 가장 실용적인 팁 문구를 3~5개 찾아 한국어로 번역/추출합니다. 
 
-### 4️⃣ Phase 4. LLM Filtering & Translation (`step3_llm_filter.py`)
-**"이 프로젝트의 꽃: 인공지능이 간병 꿀팁만 뽑아내는 단계"**
+### 4️⃣ Phase 4. Vector DB Namespace & Intelligent Caching (`step4_vector_db.py`)
+**"지식을 키워드별로 격리 보관하고, 즉시 꺼내어 똑똑하게 대답하는 단계"**
 
-*   **사용 API:** **OpenAI API (`gpt-4o-mini` 모델 형)**.
-*   **설정 및 기술:** Zero-Temperature (`temperature=0.1`로 설정하여 AI의 창의성을 끄고 극도의 이성적이고 보수적인 모드로 만듦), **JSON Mode**, **One-Shot Prompting**.
-*   **작동 방식 및 LLM의 명확한 역할:** 
-    조립이 완료된 **"군더더기 없는 논문 전체 풀 텍스트(Full-Text)"**를 OpenAI 서버로 전송하며, LLM에게 **3가지 동시 임무**를 내립니다.
-    1. **합격/불합격 심사관 역할 (PASS/FAIL):** 
-       "이 논문이 통계 분석이나 모델링을 다루는 딱딱한 학술 논문이더라도, 본문이나 결론부에 간병인을 위한 **'치매 환자 대처법, 목욕 요령, 간병인 스트레스 해소법'**이 한 문단이라도 숨어있다면 무조건 PASS 시키고, 그런 게 전혀 없는 순수 의학 분자구조 논문이면 FAIL 시켜라."
-    2. **데이터 발췌자 역할 (Extraction):** 
-       PASS된 논문이라면, 방금 말한 그 '실무 가이드라인'에 해당하는 오리지널 영어 문장을 논문 안에서 샅샅이 찾아내서 복사해라. (`original_english_text`)
-    3. **전문 통번역가 역할 (Translation):** 
-       찾아낸 그 영어 문장을 기반으로 한국 요양보호사들이 읽고 바로 이해할 수 있도록 깔끔한 한국어 행동 요령으로 번역해라. 단, 논문에 없는 너의 원래 의학 지식은 절대 섞지 마라! (`translated_korean_guideline`)
+*   **FAISS Namespace (병실 격리):**
+    수집된 JSON 지식들을 `index_치매.bin`, `index_욕창.bin` 처럼 무조건 키워드별로 쪼개어(Namespace) 저장합니다. 이를 통해 치매 질문에 욕창 지식이 섞여 나오는 치명적인 노이즈를 0%로 차단합니다.
+*   **지능형 캐싱 라우팅 (Cache Hit / Miss):**
+    사용자가 질문했을 때 무작정 크롤링을 도는 것이 아니라, 먼저 해당 키워드의 Vector DB 방을 두드려봅니다.
+    1. **Cache Hit**: 내부에 이미 답변할 지식이 충분하다면(`ntotal > 0`), 크롤러를 스킵하고 0.1초 만에 DB에서 최고 품질의 팁을 꺼내옵니다.
+    2. **Cache Miss**: 내부에 지식이 부족하다면, 백그라운드에서 크롤링 모듈(`step1`~`step3`)을 가동시켜 실시간으로 새로운 지식을 학습하고 DB에 채워 넣습니다.
+*   **LLM 필터링 락(Lock):** `is_actionable_tip == True` 인 순도 100%의 실무 요양 팁만 DB에 들어가도록 `upsert_json_data` 함수에 강력한 필터락이 걸려있습니다.
 
-### 5️⃣ Phase 5. Validation & Export (`step2_crawler_parser.py` & `schema.json`)
-**"최종 데이터를 규격에 맞게 포장하는 단계"**
+### 🚀 Phase 5. 하이브리드 검색 및 원문 보존 스키마 (Deployed)
+**"원문을 100% 보존하면서 메모리 무결성(OOM 방지)과 핀포인트 키워드 매칭(하이브리드) 검색까지 완벽 지원하는 최종 고도화 단계"**
 
-*   **사용 라이브러리:** `jsonschema`, `json`
-*   **작동 방식:**
-    1. 파이썬 코드가 스스로 파트 3에서 만든 "구조화된 영문 트리 본문"과 파트 4에서 LLM이 보내준 "한국어 쌍 번역본 Array"를 하나의 딕셔너리로 결합합니다.
-    2. `schema.json`에 정의된 엄격한 룰(Title이 꼭 있어야 함, 타입은 Array여야 함 등)에 맞는지 검증(`jsonschema.validate()`)합니다.
-    3. 통과를 완료하면 비로소 `output/파일명.json` 이라는 완성된 하나의 지식 데이터 파일이 탄생합니다.
+*   **원문 100% 보존 전략:** QA 억지 생성을 최소화하고, 노이즈가 제거된 `raw_text` 전체를 그대로 유지하여 RAG 프롬프트에 문맥 유실(Context Loss) 없이 전달합니다.
+*   **하이브리드 검색 (Hybrid Search):** LLM이 문서를 분석할 때 `["치매", "알츠하이머"]` 등 핵심 질환명과 메타 태그(`search_keywords`)를 명시적으로 뽑아내어 메타데이터에 박아둡니다.
+*   **결과:** 사용자가 특정 질환명을 검색할 때, 의미를 찾는 벡터 검색(Vector Search)에 **정확한 키워드가 포함된 문서를 우선순위(가산점)로 끌어올리는 완벽한 하이브리드 매칭**이 가능해집니다. 이를 통해 AI의 정보 환각(Hallucination) 현상이 근본적으로 차단됩니다.
 
 ---
-> **요약하자면:** 파이썬 정규식 코드가 PDF를 다운받아 잡동사니를 싹 버리고 고기로 치면 순살(본문)만 발라내면, OpenAI가 그 순살 안에서 특별히 맛있는 부위(간병 꿀팁)만 기가 막히게 찾아내서 한국어 양념(번역)을 발라 돌려주는 시스템이라고 보시면 가장 정확합니다!
-
 
 ## 🛠 설치 및 사용 방법
 
@@ -76,33 +73,55 @@ pip install -r requirements.txt
 ```
 
 ### 3. 환경 변수 설정
-최상단 디렉토리에 `.env` 파일을 만들고 OpenAI API 키를 넣어야 합니다. (보안상 GitHub에 절대 올리지 마세요!)
+최상단 디렉토리에 `.env` 파일을 만들고 OpenAI API 키와 LlamaParse API 키를 넣어야 합니다.
 ```env
-OPENAI_API_KEY="sk-proj-본인의_API_키를_여기에_붙여넣으세요"
+OPENAI_API_KEY="sk-proj-본인의_OPENAI_API_키"
+LLAMA_CLOUD_API_KEY="llx-본인의_LLAMAPARSE_API_키"
 ```
 
 ### 4. 파이프라인 실행
-명령어 한 줄이면 알아서 탐색 ➔ 다운로드 ➔ 정제 ➔ 추론 ➔ JSON 변환까지 자동으로 척척 수행합니다.
+명령어 한 줄이면 알아서 탐색 ➔ 수집 ➔ 정제 ➔ LLM 추론 ➔ JSON/TXT 저장 기능을 모두 수행합니다.
 
 ```bash
-# 기본 실행 (치매 관련 5개 논문 처리)
+# 기본 실행 (치매 관련 5개 문서 처리)
 python main.py --keyword "치매" --max-sources 5
 
-# 키워드 변경
-python main.py --keyword "고혈압" --max-sources 3
+# 키워드 변경 및 처리 개수 지정
+python main.py --keyword "고혈압" --max-sources 1
 ```
 
 ---
 
+## 📂 핵심 출력물 예시 (Flat JSON)
+`output/` 폴더에 생성되는 최종 JSON 파일의 구조는 다음과 같습니다.
+```json
+{
+  "document_id": "DOC_001",
+  "source_metadata": {
+    "source_name": "Europe PMC",
+    "source_url": "...",
+    "title": "논문 제목"
+  },
+  "document_summary": "이 연구는 알츠하이머 환자 보호자의 부담을 조사하였습니다...",
+  "chunks": [
+    {
+      "chunk_id": "uuid-...",
+      "search_keywords": ["치매 보호자", "우울증", "부담"],
+      "selection_reason_ko": "치매 환자 보호자가 겪는 우울증의 주요 원인과 이를 완화하기 위한 사회적 지원의 필요성이 서술되어 있습니다.",
+      "raw_text": "원본 마크다운 텍스트 100% 보존 블록..."
+    }
+  ]
+}
+```
+
 ## 📂 파일 구조 설명
 
-- **`main.py`**: CLI 진입점. (여기서 명령어 키워드를 받습니다.)
-- **`step1_discovery.py`**: [Phase 1] PMC 및 NID에서 PDF 다운로드 링크 헌팅 엔진.
-- **`step2_crawler_parser.py`**: [Phase 2, 3, 5] 다운로드, 구조화 파싱, 최종 JSON 검증 엔진을 모두 담당하는 파이프라인 뼈대.
-- **`step3_llm_filter.py`**: [Phase 4] OpenAI API를 이용한 본문 PASS/FAIL 분류 및 한영 발췌·요약 엔진.
-- **`schema.json`**: 출력될 데이터의 JSON 형태를 강제하는 구조체 파일. (이 규격 통과 못하면 파일 안 만듦)
-- **`output/`**: (gitignore됨) 성공적으로 파싱+번역된 최종 지식 JSON 파일들이 떨어지는 곳.
-- **`pdf/`**: (gitignore됨) 임시로 다운로드 받은 PDF 원본 보관소.
-
----
-**Note:** `.gitignore`에 의해 덩치가 큰 `pdf/` 파일들과 핵심 자산인 `output/` 결과 지식, 그리고 보안키가 든 `.env`는 깃허브에 절대 업로드되지 않습니다. 직접 실행해서 돌려보세요!
+- **`main.py`**: CLI 진입점 및 전체 파이프라인 조립체.
+- **`step1_discovery.py`**: PMC, PubMed, NID, Wikipedia 등 소스 헌팅 로직.
+- **`step2_crawler_parser.py`**: 텍스트 다운로드, LlamaParse 변환, 백업(.txt/.html) 생성 및 노이즈 필터 모듈.
+- **`step3_llm_filter.py`**: OpenAI JSON Mode를 통한 PASS/FAIL 평가 및 요약/팁 추출 엔진.
+- **`step4_vector_db.py`**: FAISS 로컬 벡터 인덱싱, Namespace 분리, Cache Hit/Miss 오케스트레이션 엔진.
+- **`schema.json`**: 출력될 데이터의 JSON 형태를 강제하는 구조체 (Flat 버전).
+- **`db/faiss/`**: Namespace별로 생성된 FAISS 인덱스(`.bin`)와 메타데이터(`.json`)가 저장되는 핵심 지식 저장소.
+- **`output/`**: 파이프라인 처리 후 최종 JSON 및 원문 텍스트(.txt/.html) 백업 파일이 생성되는 곳.
+- **`pdf/`**: 다운로드 받은 PDF 원본 임시 보관소.

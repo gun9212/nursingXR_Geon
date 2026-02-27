@@ -17,25 +17,25 @@ CrawlPipeline — 단일 소스 크롤링·파싱·검증 파이프라인
 """
 
 import re
-import json
 import logging
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from dataclasses import dataclass, field
 from typing import Optional, List
 
-# --- 외부 라이브러리 ---
-# pip install requests beautifulsoup4 lxml jsonschema PyMuPDF
+# pip install requests beautifulsoup4 lxml PyMuPDF
 import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 
 try:
-    import fitz  # PyMuPDF
+    from llama_parse import LlamaParse
+    import nest_asyncio
+    nest_asyncio.apply()
+    load_dotenv()
 except ImportError:
-    print("[오류] pip install PyMuPDF")
+    print("[오류] pip install llama-parse python-dotenv")
     raise
 
-from jsonschema import validate, ValidationError
 from step1_discovery import DiscoveredSource
 
 # ============================================================================
@@ -49,40 +49,14 @@ logger = logging.getLogger("CrawlPipeline")
 PROJECT_ROOT = Path(__file__).resolve().parent
 SCHEMA_PATH = PROJECT_ROOT / "schema.json"
 OUTPUT_DIR = PROJECT_ROOT / "output"
+RAW_DIR = OUTPUT_DIR / "raw"
+PROCESSED_DIR = OUTPUT_DIR / "processed"
 PDF_DIR = PROJECT_ROOT / "pdf"
 KST = timezone(timedelta(hours=9))
 
 # ============================================================================
-# Regex 패턴 (Crawling_Plan.md Phase 3.2.1)
+# PDF 노이즈 패턴 (최소화 - 쪽 번호 등만 제거)
 # ============================================================================
-HEADING_PATTERNS = {
-    # === 한글 교과서 ===
-    "topic": re.compile(r"^제?\s*\d+편\s+(.+)$|^Part\s+\d+[:\s]+(.+)$"),
-    "section": re.compile(r"^제?\s*(\d+)절\s+(.+)$|^(\d+)절\s+(.+)$"),
-    "chapter": re.compile(r"^(\d+)\.\s+([A-Z가-힣].+)$"),
-    "item": re.compile(r"^([가-힣])\.\s+(.+)$"),
-    "sub_item_numbered": re.compile(r"^(\d+)\)\s+(.+)$"),
-
-    # === 한글 학술논문 (로마 숫자) ===
-    "section_roman_ko": re.compile(r"^([ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+)\.\s+(.+)$"),
-
-    # === 영문 학술논문 ===
-    "section_en": re.compile(
-        r"^(\d+)\.\s+(Introduction|Background|Methods?|Materials?"
-        r"|Results?|Discussion|Conclusions?|Limitations?"
-        r"|Implications|Recommendations|References"
-        r"|Literature\s+Review|Theoretical\s+Framework"
-        r"|Data\s+Analysis|Findings|Study\s+Design"
-        r"|Ethical\s+Considerations|Acknowledgments?)\s*$",
-        re.IGNORECASE
-    ),
-    "sub_section_en": re.compile(r"^(\d+)\.(\d+)\s+(.+)$"),
-    "item_alpha": re.compile(r"^([A-Z])\.\s+(.+)$"),
-}
-
-BULLET_PATTERN = re.compile(r"^[•·]\s*(.+)$")
-
-# PDF 노이즈 패턴 (Phase 3.1.1 강화)
 NOISE_PATTERNS = {
     "page_number": re.compile(
         r"^[-─—]\s*\d+\s*[-─—]$|"
@@ -91,18 +65,12 @@ NOISE_PATTERNS = {
         r"^\d{1,4}\s*$",
         re.IGNORECASE
     ),
-    "page_header": re.compile(
-        r"^\d{2,4}\s*\d*\s*(장|부|편)[_\s].+$"
-    ),
     "footer_repeated": re.compile(
         r"^(보건복지부|국민건강보험공단|요양보호사\s*양성\s*표준교재|중앙치매센터)\s*$"
     ),
     "copyright": re.compile(
         r"copyright|ⓒ|©|all\s+rights\s+reserved|공공누리",
         re.IGNORECASE
-    ),
-    "figure_ref": re.compile(
-        r"^\[.+\]\s*$|^<.+>\s*$|^\(그림\s*\d*\)|^\(표\s*\d*\)"
     ),
     "pdf_artifact": re.compile(
         r"^[\x00-\x1f]+$|"
@@ -112,42 +80,7 @@ NOISE_PATTERNS = {
 }
 
 
-# ============================================================================
-# 데이터 클래스
-# ============================================================================
-@dataclass
-class SubItemData:
-    sub_title: str
-    sub_description: str
-
-@dataclass
-class ItemData:
-    item_title: str
-    description: str
-    sub_items: List[SubItemData] = field(default_factory=list)
-    tags: list = field(default_factory=list)
-
-@dataclass
-class ChapterData:
-    chapter_title: str
-    chapter_number: int
-    items: list = field(default_factory=list)
-
-@dataclass
-class SectionData:
-    section_title: str
-    section_number: int
-    chapters: list = field(default_factory=list)
-
-@dataclass
-class DocumentData:
-    topic: str
-    keyword: str
-    sections: list = field(default_factory=list)
-    source_name: str = ""
-    source_url: str = ""
-    learning_objectives: list = field(default_factory=list)
-    extracted_korean_guidelines: list = field(default_factory=list)
+# 더이상 트리 구조 DocumentData 클래스들을 사용하지 않습니다.
 
 
 # ============================================================================
@@ -167,24 +100,18 @@ class CrawlPipeline:
         self.keyword = keyword
         self.raw_text = ""
         self.parsed_data = None
-        self.schema = self._load_schema()
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        RAW_DIR.mkdir(parents=True, exist_ok=True)
+        PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
         PDF_DIR.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"  파이프라인 초기화: [{source.format.upper()}] {source.title[:60]}")
-
-    def _load_schema(self) -> dict:
-        if not SCHEMA_PATH.exists():
-            raise FileNotFoundError(f"Schema 없음: {SCHEMA_PATH}")
-        with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
 
     # ================================================================
     # Phase 2: 데이터 수집 — PDF/HTML 자동 분기
     # ================================================================
     def fetch_data(self) -> str:
         url = self.source.url
-        logger.info(f"  [Fetch] 다운로드: {url[:80]}")
+        logger.info(f"  [Fetch] 다운로드/텍스트추출 시작: {url[:80]}")
 
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -192,7 +119,15 @@ class CrawlPipeline:
             "Accept-Language": "ko-KR,ko;q=0.9",
         }
 
-        if self.source.format == "pdf":
+        if self.source.source_name == "Wikipedia":
+            self.raw_text = self._fetch_wikipedia()
+        elif self.source.format == "local_pdf":
+            local_path = Path(url.removeprefix("file://"))
+            logger.info(f"  [Fetch] 로컬 PDF 바로 읽기 시작: {local_path.name}")
+            self.raw_text = self._extract_text_from_pdf(local_path)
+        elif self.source.format == "xml":
+            self.raw_text = self._fetch_xml(url, headers)
+        elif self.source.format == "pdf":
             self.raw_text = self._fetch_pdf(url, headers)
         else:
             self.raw_text = self._fetch_html(url, headers)
@@ -201,13 +136,43 @@ class CrawlPipeline:
                     f"{len(self.raw_text.splitlines()):,}라인")
         return self.raw_text
 
+    def _fetch_wikipedia(self) -> str:
+        """위키피디아 패키지를 통해 깔끔한 순수 텍스트를 바로 가져옵니다."""
+        import wikipedia
+        wikipedia.set_lang("ko")
+        try:
+            page = wikipedia.page(self.source.title, auto_suggest=False)
+            logger.info(f"  [Wikipedia] '{page.title}' 콘텐츠 로드 완료")
+
+            safe_name = re.sub(r'[^\w\-.]', '_', self.source.title[:40]) + ".txt"
+            txt_path = RAW_DIR / safe_name
+            try:
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write(page.content)
+                logger.info(f"  [Wikipedia] 원문 텍스트 백업 저장: {txt_path.name}")
+            except Exception as e:
+                logger.warning(f"  [Wikipedia] 원문 텍스트 백업 저장 실패: {e}")
+
+            return page.content
+        except Exception as e:
+            raise ValueError(f"Wikipedia 문서 가져오기 실패: {e}")
+
     def _fetch_pdf(self, url: str, headers: dict) -> str:
         headers["Accept"] = "application/pdf,*/*"
-        try:
-            resp = requests.get(url, headers=headers, timeout=30, stream=True)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            raise ConnectionError(f"PDF 다운로드 실패: {e} → {url}")
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Increase timeout to 60s for large PDFs
+                resp = requests.get(url, headers=headers, timeout=60, stream=True)
+                resp.raise_for_status()
+                break # Success
+            except requests.RequestException as e:
+                logger.warning(f"  [Fetch] PDF 다운로드 실패 (시도 {attempt+1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:
+                    raise ConnectionError(f"PDF 다운로드 최종 실패: {e} → {url}")
+                import time
+                time.sleep(2) # Backoff
 
         # 파일명 결정
         safe_name = re.sub(r'[^\w\-.]', '_', self.source.title[:40]) + ".pdf"
@@ -221,12 +186,29 @@ class CrawlPipeline:
         return self._extract_text_from_pdf(pdf_path)
 
     def _fetch_html(self, url: str, headers: dict) -> str:
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                resp = requests.get(url, headers=headers, timeout=30)
+                resp.raise_for_status()
+                resp.encoding = "utf-8"
+                break
+            except requests.RequestException as e:
+                logger.warning(f"  [Fetch] HTML 크롤링 실패 (시도 {attempt+1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:
+                    raise ConnectionError(f"HTML 크롤링 최종 실패: {e} → {url}")
+                import time
+                time.sleep(2)
+
+        # 원본 HTML 저장
+        safe_name = re.sub(r'[^\w\-.]', '_', self.source.title[:40]) + ".html"
+        html_path = RAW_DIR / safe_name
         try:
-            resp = requests.get(url, headers=headers, timeout=15)
-            resp.raise_for_status()
-            resp.encoding = "utf-8"
-        except requests.RequestException as e:
-            raise ConnectionError(f"HTML 크롤링 실패: {e} → {url}")
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(resp.text)
+            logger.info(f"  [HTML] 원본 파일 백업 저장: {html_path.name}")
+        except Exception as e:
+            logger.warning(f"  [HTML] 원본 파일 백업 저장 실패: {e}")
 
         soup = BeautifulSoup(resp.text, "lxml")
         for tag in soup.find_all(["script", "style", "nav", "aside", "footer"]):
@@ -234,40 +216,151 @@ class CrawlPipeline:
         content = soup.find("div", class_="content") or soup.find("main") or soup.body
         return content.get_text(separator="\n", strip=True) if content else ""
 
+    def _fetch_xml(self, url: str, headers: dict) -> str:
+        """Europe PMC XML 구조(JATS)에서 순수 텍스트만 추출"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                resp = requests.get(url, headers=headers, timeout=30)
+                resp.raise_for_status()
+                break
+            except requests.RequestException as e:
+                logger.warning(f"  [Fetch] XML 크롤링 실패 (시도 {attempt+1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:
+                    raise ConnectionError(f"XML API 호출 최종 실패: {e} → {url}")
+                import time
+                time.sleep(2)
+
+        soup = BeautifulSoup(resp.content, "xml")
+        
+        # 레퍼런스, 표, 수식 등 잡음 제거
+        for ref in soup.find_all(["ref-list", "table-wrap", "table", "fig", "disp-formula", "ack", "fn-group"]):
+            ref.decompose()
+            
+        sections = []
+        
+        # 초록(Abstract) 추출
+        abstract = soup.find("abstract")
+        if abstract:
+            sections.append("=== Abstract ===")
+            sections.append(abstract.get_text(separator="\n", strip=True))
+        
+        # 본문(Body) 추출
+        body = soup.find("body")
+        if body:
+            sections.append("\n=== Main Text ===")
+            for sec in body.find_all("sec", recursive=False):
+                title = sec.find("title")
+                if title:
+                    sections.append(f"\n## {title.get_text(strip=True)}")
+                    title.decompose()
+                sections.append(sec.get_text(separator="\n", strip=True))
+                
+        extracted_text = "\n".join(sections)
+        logger.info(f"  [XML] JATS 구조 텍스트 추출 완료 → {len(extracted_text):,}글자")
+        return extracted_text
+
     def _extract_text_from_pdf(self, pdf_path: Path) -> str:
-        logger.info(f"  [PyMuPDF] 텍스트 추출: {pdf_path.name}")
-        all_text = []
+        logger.info(f"  [LlamaParse] 텍스트 마크다운 추출 시작: {pdf_path.name}")
         try:
-            doc = fitz.open(str(pdf_path))
-            total_pages = len(doc)
-            for page_num in range(total_pages):
-                page_text = doc[page_num].get_text("text")
-                if page_text and page_text.strip():
-                    all_text.append(page_text)
-            doc.close()
-            logger.info(f"  [PyMuPDF] {total_pages}페이지 → {sum(len(t) for t in all_text):,}글자")
+            parser = LlamaParse(result_type="markdown")
+            
+            # 파일 크기 검사 (20MB 기준)
+            file_size_mb = pdf_path.stat().st_size / (1024 * 1024)
+            if file_size_mb > 20.0:
+                logger.warning(f"  [LlamaParse] 대용량 PDF 감지 ({file_size_mb:.1f}MB). 50장 단위 분할 파싱을 시도합니다.")
+                return self._extract_large_pdf(pdf_path, parser)
+            
+            # 일반 파싱
+            documents = parser.load_data(str(pdf_path))
+            
+            all_text = []
+            for doc in documents:
+                if doc.text and doc.text.strip():
+                    all_text.append(doc.text)
+                    
+            combined_text = "\n".join(all_text)
+            logger.info(f"  [LlamaParse] 추출 완료 → {len(combined_text):,}글자")
+            return combined_text
         except Exception as e:
-            raise ValueError(f"PDF 텍스트 추출 실패: {e} → {pdf_path}")
-        return "\n".join(all_text)
+            raise ValueError(f"LlamaParse PDF 텍스트 추출 실패: {e} → {pdf_path}")
+
+    def _extract_large_pdf(self, pdf_path: Path, parser: LlamaParse) -> str:
+        import PyPDF2
+        combined_markdown = []
+        
+        try:
+            with open(pdf_path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                total_pages = len(reader.pages)
+                chunk_size = 50
+                
+                logger.info(f"  [LlamaParse] 총 {total_pages}페이지. {chunk_size}쪽씩 전송합니다.")
+                
+                for i in range(0, total_pages, chunk_size):
+                    chunk_end = min(i + chunk_size, total_pages)
+                    logger.info(f"    - 파싱 중: p.{i+1} ~ p.{chunk_end}")
+                    
+                    writer = PyPDF2.PdfWriter()
+                    for j in range(i, chunk_end):
+                        writer.add_page(reader.pages[j])
+                        
+                    temp_chunk_path = pdf_path.with_name(f"temp_chunk_{i}.pdf")
+                    with open(temp_chunk_path, "wb") as chunk_out:
+                        writer.write(chunk_out)
+                        
+                    # LlamaParse에 청크 전송
+                    documents = parser.load_data(str(temp_chunk_path))
+                    for doc in documents:
+                        if doc.text and doc.text.strip():
+                            combined_markdown.append(doc.text)
+                            
+                    # 임시 파일 삭제
+                    if temp_chunk_path.exists():
+                        temp_chunk_path.unlink()
+                        
+            final_text = "\n".join(combined_markdown)
+            logger.info(f"  [LlamaParse] 대용량 추출 완료 → {len(final_text):,}글자")
+            return final_text
+            
+        except Exception as e:
+            raise ValueError(f"대용량 PDF 분할 추출 중 오류 발생: {e}")
 
     # ================================================================
-    # Phase 3: 텍스트 파싱 및 트리 구조화
+    # Phase 3: 텍스트 파싱 및 노이즈 제거 (가공 없이 보존)
     # ================================================================
-    def clean_and_parse_text(self) -> dict:
+    def clean_and_parse_text(self) -> str:
         if not self.raw_text:
             raise ValueError("먼저 fetch_data()를 실행하세요.")
 
-        lines = self._remove_noise(self.raw_text)
-        document = self._build_tree_structure(lines)
-        self.parsed_data = self._serialize_to_json(document)
-
-        secs = self.parsed_data.get("sections", [])
-        chs = sum(len(s.get("chapters", [])) for s in secs)
-        its = sum(len(c.get("items", [])) for s in secs for c in s.get("chapters", []))
-        sis = sum(len(i.get("sub_items", [])) for s in secs
-                  for c in s.get("chapters", []) for i in c.get("items", []))
-        logger.info(f"  [Parse] Sec:{len(secs)} Ch:{chs} It:{its} Sub:{sis}")
-        return self.parsed_data
+        # 1. 문서 앞뒤 쓰레기(페이지 번호 등) 최소한으로 컷
+        cleaned_lines = self._remove_noise(self.raw_text)
+        cleaned_markdown = "\n".join(cleaned_lines)
+        
+        # 2. Raw 마크다운 파일로 저장
+        safe = re.sub(r'[^\w가-힣\-]', '_', self.source.title[:50])
+        output_filename = f"{safe}.md"
+        path = RAW_DIR / output_filename
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(cleaned_markdown)
+            
+        logger.info(f"  [Parse] 파이썬 파싱 완료 및 Raw 마크다운 저장: {path.name} ({path.stat().st_size:,} bytes)")
+        
+        # main.py에서 step3_llm_filter.py(process_with_llm)에 넘길 metadata 조립용
+        self.parsed_data = {
+            "metadata": {
+                "source_name": self.source.source_name,
+                "source_url": self.source.url,
+                "title": self.source.title,
+                "original_language": self.source.language,
+                "doi": self.source.extra.get("doi") if self.source.extra else None,
+                "crawled_at": datetime.now(KST).isoformat(),
+                "extra": self.source.extra or {},
+            }
+        }
+        
+        self.raw_text = cleaned_markdown
+        return str(path)
 
     def _remove_noise(self, text: str) -> list:
         cleaned, noise_count = [], 0
@@ -287,258 +380,7 @@ class CrawlPipeline:
                         break
             if is_noise:
                 noise_count += 1
-                continue
-            cleaned.append(s)
+            else:
+                cleaned.append(s)
         logger.info(f"  [Noise] {noise_count}줄 제거 → {len(cleaned)}줄 유지")
         return cleaned
-
-    def _build_tree_structure(self, lines: list) -> DocumentData:
-        doc = DocumentData(
-            topic="", keyword=self.keyword,
-            source_name=self.source.source_name,
-            source_url=self.source.url,
-        )
-
-        current_section = None
-        current_chapter = None
-        current_item = None
-        current_sub_title = None
-        desc_buffer = []
-        sub_desc_buffer = []
-        learning_obj_mode = False
-
-        for line in lines:
-            # 학습목표
-            if line == "학습목표":
-                learning_obj_mode = True
-                continue
-            if learning_obj_mode:
-                bullet = BULLET_PATTERN.match(line)
-                if bullet:
-                    doc.learning_objectives.append(bullet.group(1))
-                    continue
-                else:
-                    learning_obj_mode = False
-
-            # Topic
-            topic_m = HEADING_PATTERNS["topic"].match(line)
-            if topic_m and not doc.topic:
-                doc.topic = line
-                continue
-            if not doc.topic and len(line) < 30 and not any(
-                p.match(line) for p in HEADING_PATTERNS.values()
-            ):
-                doc.topic = line
-                continue
-
-            # Section (절)
-            sec_m = HEADING_PATTERNS["section"].match(line)
-            if sec_m:
-                self._flush_sub(current_item, current_sub_title, sub_desc_buffer)
-                self._flush_desc(current_item, desc_buffer)
-                sec_num = sec_m.group(1) or sec_m.group(3)
-                current_section = SectionData(section_title=line, section_number=int(sec_num))
-                doc.sections.append(current_section)
-                current_chapter = None
-                current_item = None
-                current_sub_title = None
-                continue
-
-            # Section — 한글 논문 로마 숫자 (Ⅰ. 서론, Ⅱ. 연구방법)
-            roman_m = HEADING_PATTERNS["section_roman_ko"].match(line)
-            if roman_m:
-                self._flush_sub(current_item, current_sub_title, sub_desc_buffer)
-                self._flush_desc(current_item, desc_buffer)
-                roman_num = "ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ".index(roman_m.group(1)[0]) + 1
-                current_section = SectionData(section_title=line, section_number=roman_num)
-                doc.sections.append(current_section)
-                current_chapter = None
-                current_item = None
-                current_sub_title = None
-                continue
-
-            # Section — 영문 논문 (1. Introduction, 2. Methods)
-            en_sec_m = HEADING_PATTERNS["section_en"].match(line)
-            if en_sec_m:
-                self._flush_sub(current_item, current_sub_title, sub_desc_buffer)
-                self._flush_desc(current_item, desc_buffer)
-                sec_num = int(en_sec_m.group(1))
-                current_section = SectionData(section_title=line, section_number=sec_num)
-                doc.sections.append(current_section)
-                current_chapter = None
-                current_item = None
-                current_sub_title = None
-                continue
-
-            # Chapter (장) — 한글 교과서 "1. 제목" 또는 영문 하위 섹션 "2.1 Title"
-            sub_sec_en = HEADING_PATTERNS["sub_section_en"].match(line)
-            chap_m = HEADING_PATTERNS["chapter"].match(line)
-            if sub_sec_en:
-                self._flush_sub(current_item, current_sub_title, sub_desc_buffer)
-                self._flush_desc(current_item, desc_buffer)
-                chap_num = int(sub_sec_en.group(2))
-                if current_section is None:
-                    current_section = SectionData(section_title="1절 기본", section_number=1)
-                    doc.sections.append(current_section)
-                current_chapter = ChapterData(chapter_title=line, chapter_number=chap_num)
-                current_section.chapters.append(current_chapter)
-                current_item = None
-                current_sub_title = None
-                continue
-            elif chap_m:
-                self._flush_sub(current_item, current_sub_title, sub_desc_buffer)
-                self._flush_desc(current_item, desc_buffer)
-                chap_num = chap_m.group(1)
-                if current_section is None:
-                    current_section = SectionData(section_title="1절 기본", section_number=1)
-                    doc.sections.append(current_section)
-                current_chapter = ChapterData(chapter_title=line, chapter_number=int(chap_num))
-                current_section.chapters.append(current_chapter)
-                current_item = None
-                current_sub_title = None
-                continue
-
-            # Item (가. 나. 다.) 또는 (A. B. C.)
-            item_m = HEADING_PATTERNS["item"].match(line)
-            alpha_m = HEADING_PATTERNS["item_alpha"].match(line)
-            matched_item = item_m or alpha_m
-            if matched_item:
-                self._flush_sub(current_item, current_sub_title, sub_desc_buffer)
-                self._flush_desc(current_item, desc_buffer)
-                if current_chapter is None:
-                    if current_section is None:
-                        current_section = SectionData(section_title="1절 기본", section_number=1)
-                        doc.sections.append(current_section)
-                    current_chapter = ChapterData(chapter_title="1. 기본", chapter_number=1)
-                    current_section.chapters.append(current_chapter)
-                current_item = ItemData(item_title=line, description="")
-                current_chapter.items.append(current_item)
-                current_sub_title = None
-                continue
-
-            # Sub-item (1) 2) 3))
-            sub_m = HEADING_PATTERNS["sub_item_numbered"].match(line)
-            if sub_m and current_item is not None:
-                self._flush_sub(current_item, current_sub_title, sub_desc_buffer)
-                self._flush_desc(current_item, desc_buffer)
-                current_sub_title = line
-                continue
-
-            # 영문 논문 References 방어 (본문 파싱 조기 종료)
-            if current_chapter and re.match(r"^(References|Bibliography)\s*$", line, re.IGNORECASE):
-                logger.info("  → References 섹션 감지. 파싱을 조기 종료합니다.")
-                break
-
-            # 일반 텍스트 및 불릿 처리
-            # Item이 아직 없는데 텍스트가 나오면 가상의 기본 Item을 생성 (영문 논문 본문 보존용)
-            if not current_item and not line.startswith("학습목표"):
-                if current_chapter is None:
-                    if current_section is None:
-                        current_section = SectionData(section_title="1절 기본", section_number=1)
-                        doc.sections.append(current_section)
-                    current_chapter = ChapterData(chapter_title="1. 기본", chapter_number=1)
-                    current_section.chapters.append(current_chapter)
-                current_item = ItemData(item_title="본문", description="")
-                current_chapter.items.append(current_item)
-
-            # 불릿 (• ...)
-            bullet = BULLET_PATTERN.match(line)
-            if bullet:
-                bullet_text = bullet.group(1)
-                colon_split = re.split(r"[：:]", bullet_text, maxsplit=1)
-                if len(colon_split) == 2 and len(colon_split[0].strip()) < 20:
-                    self._flush_sub(current_item, current_sub_title, sub_desc_buffer)
-                    self._flush_desc(current_item, desc_buffer)
-                    current_sub_title = colon_split[0].strip()
-                    sub_desc_buffer.append(colon_split[1].strip())
-                elif current_sub_title is not None:
-                    sub_desc_buffer.append(bullet_text)
-                else:
-                    desc_buffer.append(bullet_text)
-                continue
-
-            # 일반 텍스트
-            if current_sub_title is not None:
-                sub_desc_buffer.append(line)
-            elif current_item is not None:
-                desc_buffer.append(line)
-
-        self._flush_sub(current_item, current_sub_title, sub_desc_buffer)
-        self._flush_desc(current_item, desc_buffer)
-        return doc
-
-    def _flush_desc(self, item, buffer):
-        if item is not None and buffer:
-            text = "\n".join(buffer)
-            item.description = (item.description + "\n" + text).strip() if item.description else text
-        buffer.clear()
-
-    def _flush_sub(self, item, sub_title, buffer):
-        if item is not None and sub_title is not None and buffer:
-            item.sub_items.append(SubItemData(
-                sub_title=sub_title,
-                sub_description="\n".join(buffer),
-            ))
-        buffer.clear()
-
-    def _serialize_to_json(self, doc: DocumentData) -> dict:
-        result = {
-            "topic": doc.topic or self.keyword,
-            "keyword": doc.keyword,
-            "learning_objectives": doc.learning_objectives,
-            "extracted_korean_guidelines": doc.extracted_korean_guidelines,
-            "sections": [],
-            "source_metadata": {
-                "source_name": self.source.source_name,
-                "source_url": self.source.url,
-                "original_language": self.source.language,
-                "license_type": self.source.license_type,
-                "crawled_at": datetime.now(KST).isoformat(),
-                "extra": self.source.extra or {},
-            },
-        }
-        for sec in doc.sections:
-            sec_d = {"section_title": sec.section_title, "section_number": sec.section_number, "chapters": []}
-            for ch in sec.chapters:
-                ch_d = {"chapter_title": ch.chapter_title, "chapter_number": ch.chapter_number, "items": []}
-                for it in ch.items:
-                    desc = it.description
-                    if not desc.strip() and it.sub_items:
-                        desc = " / ".join(si.sub_title for si in it.sub_items)
-                    it_d = {"item_title": it.item_title, "description": desc}
-                    if it.sub_items:
-                        it_d["sub_items"] = [
-                            {"sub_title": si.sub_title, "sub_description": si.sub_description}
-                            for si in it.sub_items
-                        ]
-                    if it.tags:
-                        it_d["tags"] = it.tags
-                    ch_d["items"].append(it_d)
-                sec_d["chapters"].append(ch_d)
-            result["sections"].append(sec_d)
-        return result
-
-    # ================================================================
-    # Phase 4: JSON 검증 및 저장
-    # ================================================================
-    def validate_and_save_json(self, output_filename: str = "") -> Optional[Path]:
-        if self.parsed_data is None:
-            raise ValueError("먼저 clean_and_parse_text()를 실행하세요.")
-
-        # 스키마 검증
-        try:
-            validate(instance=self.parsed_data, schema=self.schema)
-            logger.info("  [Validate] ✅ JSON Schema 통과")
-        except ValidationError as e:
-            logger.warning(f"  [Validate] ❌ 검증 실패: {e.message[:100]}")
-            return None
-
-        # 저장
-        if not output_filename:
-            safe = re.sub(r'[^\w가-힣\-]', '_', self.source.title[:50])
-            output_filename = f"{safe}.json"
-        path = OUTPUT_DIR / output_filename
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.parsed_data, f, ensure_ascii=False, indent=4)
-        logger.info(f"  [Save] ✅ {path.name} ({path.stat().st_size:,} bytes)")
-        return path
